@@ -17,7 +17,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+      DEFAULT_LLM_PROVIDER: ${{ secrets.DEFAULT_LLM_PROVIDER }}
       TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
       MY_PORTFOLIO_STATE: ${{ secrets.MY_PORTFOLIO_STATE }}
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
