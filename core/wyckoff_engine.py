@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2024-2026 youngcan. All Rights Reserved.
-# 本代码仅供个人学习研究使用，未经授权不得用于商业目的。
-# 商业授权请联系作者支付授权费用。
-
 """
 Wyckoff Funnel 5 层漏斗筛选引擎
 
@@ -56,9 +52,7 @@ def _latest_trade_date(df: pd.DataFrame) -> object | None:
     if df is None or df.empty or "date" not in df.columns:
         return None
     s = pd.to_datetime(df["date"], errors="coerce").dropna()
-    if s.empty:
-        return None
-    return s.iloc[-1].date()
+    return s.iloc[-1].date() if not s.empty else None
 
 
 
@@ -143,7 +137,7 @@ class FunnelConfig:
 
     # Layer 4 - Spring
     spring_support_window: int = 60
-    spring_vol_ratio: float = 1.3  # 弹簧信号要求成交量 >= 均量 1.3 倍（原 1.0 太松）
+    spring_vol_ratio: float = 1.1  # 放宽以激活 Accum 轨（原 1.3 导致 Spring 几乎不触发）
     spring_tr_max_range_pct: float = 30.0
     spring_tr_max_drift_pct: float = 12.0
     # Spring 动态振幅
@@ -155,7 +149,7 @@ class FunnelConfig:
     lps_lookback: int = 3
     lps_ma: int = 20
     lps_ma_tolerance: float = 0.02
-    lps_vol_dry_ratio: float = 0.48  # A/B 验证：0.48 夏普 2.325 >> 0.55 夏普 0.831 ⚠️ 样内优化，需 OOS 验证
+    lps_vol_dry_ratio: float = 0.65  # 放宽缩量阈值激活 Accum 轨（原 0.48 样内过拟合，几乎无 LPS 触发）
     lps_vol_ref_window: int = 60
 
     # Layer 4 - Effort vs Result
@@ -170,8 +164,8 @@ class FunnelConfig:
     evr_confirm_allow_break_pct: float = 0.0
 
     # Layer 4 - SOS / JAC (Sign of Strength / Jump Across the Creek)
-    sos_pct_min: float = 4.5  # 点火当日最小涨幅（%）
-    sos_vol_ratio: float = 2.0  # 点火当日相比近期均量的最小倍数（爆量）
+    sos_pct_min: float = 6.0  # 提高门槛过滤弱突破（原 4.5 追高触发止损率极高）
+    sos_vol_ratio: float = 2.5  # 要求更强量能确认（原 2.0 噪音太多）
     sos_vol_window: int = 20  # 计算点火爆量时的参考窗口
     sos_breakout_window: int = 20  # 要求突破或接近近 N 日的高点
     sos_breakout_tolerance: float = 0.01  # 改为 0.01：突破容差 1%（从 2% 改为 1%）
@@ -329,13 +323,19 @@ def layer1_filter(
     market_cap_map: dict[str, float],
     df_map: dict[str, pd.DataFrame],
     cfg: FunnelConfig,
+    *,
+    financial_map: dict[str, dict] | None = None,
 ) -> list[str]:
     """
     硬过滤：剔除 ST、北交所/科创板、市值<阈值、近期均成交额<阈值。
     market_cap_map 单位：亿元。若 market_cap_map 为空则跳过市值过滤。
+    financial_map 来自 TickFlow，可选；有则追加 ROE / 资产负债率硬过滤。
     """
     cap_available = bool(market_cap_map)
+    fin_available = bool(financial_map)
     passed: list[str] = []
+    l1_roe_negative = 0
+    l1_high_debt = 0
     for sym in symbols:
         if not _is_main_or_chinext(sym):
             continue
@@ -354,7 +354,20 @@ def layer1_filter(
             avg_amt = df_sorted["amount"].tail(cfg.amount_avg_window).mean()
             if pd.notna(avg_amt) and avg_amt < cfg.min_avg_amount_wan * 10000:
                 continue
+        if fin_available:
+            metrics = financial_map.get(sym)
+            if metrics:
+                roe = metrics.get("roe")
+                if roe is not None and roe < -10:
+                    l1_roe_negative += 1
+                    continue
+                debt_ratio = metrics.get("debt_to_asset_ratio")
+                if debt_ratio is not None and debt_ratio > 85:
+                    l1_high_debt += 1
+                    continue
         passed.append(sym)
+    if fin_available and (l1_roe_negative or l1_high_debt):
+        print(f"[L1] 财务过滤: ROE<-10%={l1_roe_negative}, 负债率>85%={l1_high_debt}")
     return passed
 
 
@@ -758,15 +771,6 @@ def layer2_strength_detailed(
 
 
 
-def layer2_strength(
-    symbols: list[str],
-    df_map: dict[str, pd.DataFrame],
-    bench_df: pd.DataFrame | None,
-    cfg: FunnelConfig,
-) -> list[str]:
-    passed, _ = layer2_strength_detailed(symbols, df_map, bench_df, cfg)
-    return passed
-
 
 
 
@@ -1011,7 +1015,6 @@ def _detect_spring(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     if vol_avg <= 0 or last["volume"] < vol_avg * cfg.spring_vol_ratio:
         return None
     
-    # 加入放量确认：收回时的成交量 > 下探时的成交量
     prev_vol = float(prev["volume"]) if pd.notna(prev["volume"]) else 0
     last_vol = float(last["volume"]) if pd.notna(last["volume"]) else 0
     if prev_vol > 0 and last_vol / prev_vol < cfg.spring_vol_expand_ratio:
@@ -1045,7 +1048,6 @@ def _detect_lps(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
         return None
 
     recent_max_vol = recent["volume"].max()
-    # 修正：参考期应剥离当前考察期（recent）
     ref_window_df = df_s.tail(cfg.lps_vol_ref_window + cfg.lps_lookback).iloc[:-cfg.lps_lookback]
     ref_max_vol = ref_window_df["volume"].max() if not ref_window_df.empty else 0
     if ref_max_vol <= 0:

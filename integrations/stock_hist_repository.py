@@ -18,6 +18,22 @@ from integrations.data_source import fetch_stock_hist as fetch_stock_hist_from_s
 AdjustType = Literal["", "qfq", "hfq"]
 
 
+def _collect_tickflow_limit_hints(df: pd.DataFrame | None) -> list[str]:
+    if df is None:
+        return []
+    hints = df.attrs.get("tickflow_limit_hints")
+    if isinstance(hints, list):
+        out: list[str] = []
+        for item in hints:
+            text = str(item or "").strip()
+            if text and text not in out:
+                out.append(text)
+        if out:
+            return out
+    one = str(df.attrs.get("tickflow_limit_hint", "") or "").strip()
+    return [one] if one else []
+
+
 def _load_from_md_tables(
     symbol: str, start_date: date, end_date: date, adjust: AdjustType, context: str
 ) -> pd.DataFrame | None:
@@ -82,6 +98,10 @@ def _fetch_gap(symbol: str, start_date: date, end_date: date, adjust: AdjustType
         adjust=adjust,
     )
     norm = normalize_hist_df(df)
+    hints = _collect_tickflow_limit_hints(df)
+    if hints:
+        norm.attrs["tickflow_limit_hints"] = hints
+        norm.attrs["tickflow_limit_hint"] = hints[0]
     return norm, "cache"
 
 
@@ -113,6 +133,21 @@ def get_stock_hist(
         return out_cn
 
     cache_adjust = adjust or "none"
+
+    # 不复权数据不走缓存，直接拉取（节省 Supabase 存储）
+    if cache_adjust == "none":
+        df = fetch_stock_hist_from_source(symbol=symbol, start=start_d, end=end_d, adjust=adjust)
+        norm = normalize_hist_df(df)
+        result_norm = _slice_df_by_date(norm, start_d, end_d)
+        result = denormalize_hist_df(result_norm)
+        result.attrs["source"] = "realtime"
+        hints = _collect_tickflow_limit_hints(df)
+        if hints:
+            result.attrs["tickflow_limit_hints"] = hints
+            result.attrs["tickflow_limit_hint"] = hints[0]
+            print(f"[stock_repo] ⚠️ {hints[0]}")
+        return result
+
     meta = get_cache_meta(symbol, cache_adjust, context=context)
     cached_norm: pd.DataFrame | None = None
     if meta is not None:
@@ -144,6 +179,7 @@ def get_stock_hist(
 
     gaps = _compute_gap_ranges(start_d, end_d, meta)
     fetched_frames: list[pd.DataFrame] = []
+    tickflow_limit_hints: list[str] = []
     did_fetch = False
 
     for gap_start, gap_end in gaps:
@@ -154,6 +190,9 @@ def get_stock_hist(
         )
         frame, _ = _fetch_gap(symbol, gap_start, gap_end, adjust)
         fetched_frames.append(frame)
+        for hint in _collect_tickflow_limit_hints(frame):
+            if hint not in tickflow_limit_hints:
+                tickflow_limit_hints.append(hint)
 
     merged = _merge_norm_frames(
         [cached_norm] + fetched_frames if cached_norm is not None else fetched_frames
@@ -165,6 +204,9 @@ def get_stock_hist(
         did_fetch = True
         frame, _ = _fetch_gap(symbol, start_d, end_d, adjust)
         merged = frame
+        for hint in _collect_tickflow_limit_hints(frame):
+            if hint not in tickflow_limit_hints:
+                tickflow_limit_hints.append(hint)
 
     result_norm = _slice_df_by_date(merged, start_d, end_d)
     if result_norm.empty:
@@ -173,6 +215,9 @@ def get_stock_hist(
         frame, _ = _fetch_gap(symbol, start_d, end_d, adjust)
         result_norm = _slice_df_by_date(frame, start_d, end_d)
         merged = _merge_norm_frames([merged, frame])
+        for hint in _collect_tickflow_limit_hints(frame):
+            if hint not in tickflow_limit_hints:
+                tickflow_limit_hints.append(hint)
     chosen_source = "cache"
 
     # 有缺口补拉或首次拉取时回写缓存；纯命中时不重复写
@@ -198,4 +243,8 @@ def get_stock_hist(
 
     result = denormalize_hist_df(result_norm)
     result.attrs["source"] = chosen_source
+    if tickflow_limit_hints:
+        result.attrs["tickflow_limit_hints"] = tickflow_limit_hints
+        result.attrs["tickflow_limit_hint"] = tickflow_limit_hints[0]
+        print(f"[stock_repo] ⚠️ {tickflow_limit_hints[0]}")
     return result

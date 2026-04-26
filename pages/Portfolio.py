@@ -15,12 +15,11 @@ from integrations.supabase_portfolio import (
     compute_portfolio_state_signature,
     extract_state_signature_from_run_id,
 )
+from core.constants import TABLE_PORTFOLIOS, TABLE_PORTFOLIO_POSITIONS, TABLE_TRADE_ORDERS
 from utils.trading_clock import CN_TZ, resolve_end_calendar_day
 
 PORTFOLIO_SCOPE = "USER_LIVE"
-TABLE_PORTFOLIOS = "portfolios"
-TABLE_POSITIONS = "portfolio_positions"
-TABLE_TRADE_ORDERS = "trade_orders"
+TABLE_POSITIONS = TABLE_PORTFOLIO_POSITIONS
 EDIT_BLACKOUT_WINDOWS = (
     ((7, 50), (8, 0), "盘前风控窗口"),
     ((18, 20), (18, 30), "晚间再平衡窗口"),
@@ -153,7 +152,6 @@ def _signature_positions_from_editor(editor_df: pd.DataFrame) -> list[dict[str, 
                 "shares": shares,
                 "cost_price": _to_float(row.get("成本", 0.0), 0.0),
                 "buy_dt": _format_buy_dt(row.get("建仓时间")),
-                "strategy": str(row.get("策略", "")).strip(),
             }
         )
     return items
@@ -316,7 +314,7 @@ def _load_user_live(portfolio_id: str) -> tuple[dict[str, Any], list[dict[str, A
 
     pos_resp = (
         supabase.table(TABLE_POSITIONS)
-        .select("code,name,shares,cost_price,buy_dt,strategy,updated_at")
+        .select("code,name,shares,cost_price,buy_dt,updated_at")
         .eq("portfolio_id", portfolio_id)
         .order("code")
         .execute()
@@ -335,7 +333,6 @@ def _to_editor_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "成本": _to_float(row.get("cost_price", 0.0)),
                 "数量": int(_to_float(row.get("shares", 0), 0)),
                 "建仓时间": _parse_buy_dt(row.get("buy_dt")),
-                "策略": str(row.get("strategy", "")).strip(),
                 "删除": False,
             }
         )
@@ -347,7 +344,6 @@ def _to_editor_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "成本": 0.0,
                 "数量": 0,
                 "建仓时间": None,
-                "策略": "",
                 "删除": False,
             }
         )
@@ -382,7 +378,6 @@ def _save_user_live(
         shares = int(_to_float(row.get("数量", 0), 0))
         cost_price = _to_float(row.get("成本", 0.0), 0.0)
         name = str(row.get("名称", "")).strip() or code
-        strategy = str(row.get("策略", "")).strip()
         buy_dt = _format_buy_dt(row.get("建仓时间"))
 
         if cost_price < 0:
@@ -401,7 +396,6 @@ def _save_user_live(
             "shares": shares,
             "cost_price": cost_price,
             "buy_dt": buy_dt,
-            "strategy": strategy,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -689,7 +683,6 @@ with content_col:
                         "建仓时间",
                         format="YYYY-MM-DD",
                     ),
-                    "策略": st.column_config.TextColumn("策略", max_chars=50),
                     "删除": st.column_config.CheckboxColumn("删除", default=False),
                 },
                 key="portfolio_editor",

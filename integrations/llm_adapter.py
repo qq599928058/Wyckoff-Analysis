@@ -4,7 +4,7 @@ LiteLLM 适配层 — 为 Agent 层提供统一的 LLM 调用接口。
 
 当前：
   - call_llm_via_litellm() 作为 integrations/llm_client.call_llm() 的可选替代
-  - 支持现有全部 9 个 provider: Gemini / OpenAI / DeepSeek / Qwen / Kimi / Zhipu / Volcengine / Minimax
+  - 支持现有全部 provider: Gemini / OpenAI / DeepSeek / Qwen / Zhipu / Volcengine / Minimax
   - 内部通过 LiteLLM 自动路由，无需手动切分 Gemini vs OpenAI-compat 逻辑
 
 可通过 LITELLM_ENABLED=1 启用，作为 llm_client.call_llm() 的路由替代
@@ -32,7 +32,6 @@ PROVIDER_PREFIX_MAP: dict[str, str] = {
     "openai": "openai",
     "deepseek": "deepseek",
     "qwen": "openai",        # DashScope OpenAI-compatible
-    "kimi": "openai",        # Moonshot OpenAI-compatible
     "zhipu": "openai",       # 智谱 OpenAI-compatible
     "volcengine": "openai",  # 火山引擎 OpenAI-compatible
     "minimax": "openai",     # Minimax OpenAI-compatible
@@ -81,6 +80,7 @@ def call_llm_via_litellm(
     max_output_tokens: Optional[int] = None,
     temperature: float = DEFAULT_TEMPERATURE,
     top_p: float = DEFAULT_TOP_P,
+    allow_truncated_text: bool = False,
 ) -> str:
     """
     通过 LiteLLM 调用任意 provider 的 LLM。
@@ -103,6 +103,7 @@ def call_llm_via_litellm(
     litellm_model = _resolve_litellm_model(provider, model)
     resolved_base_url = _resolve_base_url(provider, base_url)
     max_tokens = max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS
+    _ = allow_truncated_text
 
     logger.info(
         "LiteLLM call: provider=%s model=%s litellm_model=%s base_url=%s max_tokens=%d",
@@ -151,5 +152,4 @@ def call_llm_via_litellm(
         getattr(response.usage, "completion_tokens", "?"),
     )
     return content.strip()
-
 

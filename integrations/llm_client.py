@@ -17,7 +17,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 多厂商：Gemini + OpenAI 兼容（OpenAI/智谱/Minimax/DeepSeek/Qwen/Kimi/火山引擎）
+# 多厂商：Gemini + OpenAI 兼容（OpenAI/智谱/Minimax/DeepSeek/Qwen/火山引擎）
 SUPPORTED_PROVIDERS = (
     "gemini",
     "openai",
@@ -25,7 +25,6 @@ SUPPORTED_PROVIDERS = (
     "minimax",
     "deepseek",
     "qwen",
-    "kimi",
     "volcengine",
 )
 # OpenAI 兼容接口的默认 base_url（可被调用方 base_url 覆盖）
@@ -35,7 +34,6 @@ OPENAI_COMPATIBLE_BASE_URLS = {
     "minimax": "https://api.minimax.chat/v1",
     "deepseek": "https://api.deepseek.com/v1",
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "kimi": "https://api.moonshot.cn/v1",
     "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
 }
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
@@ -57,7 +55,6 @@ PROVIDER_LABELS: dict[str, str] = {
     "minimax": "Minimax",
     "deepseek": "DeepSeek",
     "qwen": "Qwen",
-    "kimi": "Kimi",
     "volcengine": "火山引擎",
 }
 
@@ -111,6 +108,7 @@ def call_llm(
     base_url: Optional[str] = None,
     timeout: int = 120,
     max_output_tokens: Optional[int] = None,
+    allow_truncated_text: bool = False,
 ) -> str:
     """
     调用大模型，返回回复文本。
@@ -124,6 +122,7 @@ def call_llm(
         images: 可选图片列表（PIL Image 或 bytes），仅部分模型支持。
         base_url: 可选代理地址，Gemini 和 OpenAI 兼容均支持。
         timeout: 请求超时秒数。
+        allow_truncated_text: 当供应商返回“输出被截断”但已有非空文本时，是否直接返回文本。
 
     Returns:
         模型回复的纯文本。
@@ -157,6 +156,7 @@ def call_llm(
                     base_url=base_url,
                     timeout=timeout,
                     max_output_tokens=max_output_tokens,
+                    allow_truncated_text=allow_truncated_text,
                 )
             except ImportError:
                 logger.warning(
@@ -177,6 +177,7 @@ def call_llm(
             images=images,
             timeout=timeout,
             max_output_tokens=max_output_tokens,
+            allow_truncated_text=allow_truncated_text,
             base_url=(base_url or "").strip(),
         )
     if provider in OPENAI_COMPATIBLE_BASE_URLS:
@@ -244,6 +245,7 @@ def _call_gemini(
     images: Optional[list],
     timeout: int,
     max_output_tokens: Optional[int],
+    allow_truncated_text: bool,
     base_url: str = "",
 ) -> str:
     from google import genai
@@ -323,6 +325,11 @@ def _call_gemini(
                 )
             )
             if finish_reason_norm in _GEMINI_TRUNCATION_REASONS:
+                if allow_truncated_text and text.strip():
+                    print(
+                        "[llm] gemini truncation tolerated: using returned text because allow_truncated_text=1"
+                    )
+                    return text
                 raise RuntimeError(
                     f"Gemini 输出被截断(finish_reason={finish_reason or 'unknown'})，请缩短输入或提升输出上限后重试"
                 )

@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2024-2026 youngcan. All Rights Reserved.
-# 本代码仅供个人学习研究使用，未经授权不得用于商业目的。
-# 商业授权请联系作者支付授权费用。
-
 """
 Wyckoff Funnel 定时任务：5 层漏斗筛选 → 多渠道推送
 
@@ -312,6 +308,26 @@ def run_funnel_job(
         print(
             "[funnel] ⚠️ 市值数据为空（TUSHARE_TOKEN 可能缺失/失效），Layer1 将跳过市值过滤"
         )
+    # TickFlow 财务指标
+    financial_map: dict[str, dict] = {}
+    tickflow_api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if tickflow_api_key:
+        try:
+            from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
+            _tf = TickFlowClient(api_key=tickflow_api_key)
+            print(f"[funnel] TickFlow 财务指标请求: symbols={len(all_symbols)}")
+            raw_fin = _tf.get_financial_metrics(all_symbols, latest=True)
+            for sym, records in raw_fin.items():
+                if records:
+                    financial_map[sym] = records[0]
+            missing = max(len(all_symbols) - len(financial_map), 0)
+            sample_missing = ",".join(sorted([s for s in all_symbols if s not in financial_map])[:8])
+            print(
+                f"[funnel] TickFlow 财务指标加载成功: {len(financial_map)}/{len(all_symbols)}, "
+                f"missing={missing}, sample_missing={sample_missing or '-'}"
+            )
+        except Exception as e:
+            print(f"[funnel] TickFlow 财务指标加载失败，跳过财务过滤: {e}")
     print(f"[funnel] 加载股票名称...")
     try:
         name_map = _stock_name_map()
@@ -378,7 +394,7 @@ def run_funnel_job(
 
     # Layer 1
     l1_input = list(all_df_map.keys())
-    l1_passed = layer1_filter(l1_input, name_map, market_cap_map, all_df_map, cfg)
+    l1_passed = layer1_filter(l1_input, name_map, market_cap_map, all_df_map, cfg, financial_map=financial_map)
 
     # Layer 2
     l2_passed, l2_channel_map = layer2_strength_detailed(
@@ -475,6 +491,8 @@ def run_funnel_job(
         "markup_symbols": markup_symbols,
         "accum_stage_map": accum_stage_map,
         "exit_signals": exit_signals,
+        "all_df_map": all_df_map,
+        "financial_map": financial_map,
     }
     if include_debug_context:
         metrics["_debug"] = {
@@ -512,6 +530,7 @@ def run(
     每项为 {"code": str, "name": str, "tag": str}。
     """
     triggers, metrics = run_funnel_job()
+    all_df_map = metrics.get("all_df_map", {})
     benchmark_context = metrics.get("benchmark_context", {}) or {}
     try:
         name_map = _stock_name_map()
@@ -767,6 +786,7 @@ def run(
                 "priority_score_map": score_map,
                 "name_map": name_map,
                 "sector_map": sector_map,
+                "all_df_map": all_df_map,
             }
             return (ok, symbols_for_report, benchmark_context, details)
         return (ok, symbols_for_report, benchmark_context)
@@ -1094,6 +1114,7 @@ def run(
             "priority_score_map": score_map,
             "name_map": name_map,
             "sector_map": sector_map,
+            "all_df_map": all_df_map,
         }
         return (ok, symbols_for_report, benchmark_context, details)
     return (ok, symbols_for_report, benchmark_context)
