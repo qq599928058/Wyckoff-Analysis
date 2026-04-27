@@ -18,6 +18,8 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Vertical
+from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
@@ -27,35 +29,15 @@ from cli.loop_guard import (
     missing_required_tool,
     resolve_turn_expectation,
 )
+from core.prompts import with_current_time
 
 
 # ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
 
-def _estimate_tokens(messages: list[dict]) -> int:
-    """粗略估算消息列表的 token 数（中文~2字/token，英文~4字符/token）。"""
-    total = 0
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, str):
-            total += max(len(content) // 2, len(content.encode("utf-8")) // 3)
-        # tool_calls 参数也占 token
-        for tc in m.get("tool_calls", []):
-            args_str = json.dumps(tc.get("args", {}), ensure_ascii=False)
-            total += len(args_str) // 3
-    return total
-
-
-_COMPACTION_PROMPT = """请将以下对话历史总结为简洁的上下文摘要，保留关键信息：
-1. 用户的目标和意图
-2. 已完成的操作和结果
-3. 重要的数据发现（股票代码、价格、信号等）
-4. 未完成的任务
-
-用中文输出，控制在 500 字以内。只输出摘要，不要其他内容。"""
-
-_MAX_INCOMPLETE_TOOL_RETRIES = 2
+from cli.compaction import TAIL_KEEP as _TAIL_KEEP_DEFAULT, compact_messages, estimate_tokens
+from cli.loop_guard import MAX_INCOMPLETE_TOOL_RETRIES as _MAX_INCOMPLETE_TOOL_RETRIES
 
 
 def _pop_lines(log_widget, n: int) -> None:
@@ -146,6 +128,130 @@ class _InputState:
 
 
 # ---------------------------------------------------------------------------
+# 工具确认弹窗
+# ---------------------------------------------------------------------------
+
+class ToolConfirmScreen(ModalScreen[dict]):
+    """高风险工具执行前的确认弹窗。"""
+
+    DEFAULT_CSS = """
+    ToolConfirmScreen {
+        align: center middle;
+    }
+    #confirm-box {
+        width: 64;
+        max-height: 20;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #confirm-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #confirm-summary {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #confirm-options {
+        height: auto;
+        max-height: 6;
+    }
+    #confirm-edit {
+        display: none;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    def __init__(self, tool_name: str, args: dict, display_name: str):
+        super().__init__()
+        self.tool_name = tool_name
+        self.tool_args = args
+        self.display_name = display_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-box"):
+            yield Static(
+                f"⚠ [bold]{self.display_name}[/bold] 需要确认",
+                id="confirm-title",
+            )
+            yield Static(self._format_summary(), id="confirm-summary")
+            yield OptionList(
+                Option("允许一次", id="once"),
+                Option("本次会话总是允许", id="always"),
+                Option("修改后执行", id="edit"),
+                Option("不允许", id="deny"),
+                id="confirm-options",
+            )
+            yield Input(
+                value=self._editable_value(),
+                placeholder="修改后按 Enter 执行",
+                id="confirm-edit",
+            )
+
+    def _format_summary(self) -> str:
+        if self.tool_name == "exec_command":
+            return f"  命令: {self.tool_args.get('command', '')}"
+        if self.tool_name == "write_file":
+            path = self.tool_args.get("path", "")
+            size = len(self.tool_args.get("content", ""))
+            return f"  路径: {path}\n  内容: {size} 字符"
+        if self.tool_name == "update_portfolio":
+            action = self.tool_args.get("action", "")
+            code = self.tool_args.get("code", "")
+            parts = [f"操作: {action}"]
+            if code:
+                parts.append(f"代码: {code}")
+            shares = self.tool_args.get("shares")
+            if shares:
+                parts.append(f"股数: {shares}")
+            cost = self.tool_args.get("cost_price")
+            if cost:
+                parts.append(f"成本: {cost}")
+            cash = self.tool_args.get("free_cash")
+            if cash is not None:
+                parts.append(f"现金: {cash}")
+            return "  " + "  ".join(parts)
+        return f"  {json.dumps(self.tool_args, ensure_ascii=False)}"
+
+    def _editable_value(self) -> str:
+        if self.tool_name == "exec_command":
+            return self.tool_args.get("command", "")
+        if self.tool_name == "write_file":
+            return self.tool_args.get("path", "")
+        return json.dumps(self.tool_args, ensure_ascii=False)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_id == "edit":
+            self.query_one("#confirm-options").display = False
+            edit_input = self.query_one("#confirm-edit", Input)
+            edit_input.display = True
+            edit_input.focus()
+        else:
+            self.dismiss({"action": event.option_id})
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "confirm-edit":
+            return
+        modified = dict(self.tool_args)
+        if self.tool_name == "exec_command":
+            modified["command"] = event.value
+        elif self.tool_name == "write_file":
+            modified["path"] = event.value
+        else:
+            try:
+                modified = json.loads(event.value)
+            except json.JSONDecodeError:
+                pass
+        self.dismiss({"action": "edit", "modified_args": modified})
+
+    def action_cancel(self) -> None:
+        self.dismiss({"action": "deny"})
+
+
+# ---------------------------------------------------------------------------
 # 主应用
 # ---------------------------------------------------------------------------
 
@@ -218,6 +324,7 @@ class WyckoffTUI(App):
         self._bg_manager = BackgroundTaskManager()
         if self._tools:
             self._tools.set_background_manager(self._bg_manager, self._on_bg_complete)
+            self._tools.set_confirm_callback(self._request_tool_confirm)
         # 交互式输入状态
         self._input_mode = _InputState.NONE
         self._input_buf: dict[str, str] = {}
@@ -268,7 +375,47 @@ class WyckoffTUI(App):
     def _update_status(self) -> None:
         self.query_one("#status-bar", StatusBar).update(self._build_status_text())
 
+    # ----- 工具确认 -----
+
+    def _request_tool_confirm(self, name: str, args: dict) -> dict:
+        """从 worker 线程调用，阻塞直到用户在弹窗中做出选择。"""
+        import threading as _th
+
+        event = _th.Event()
+        result: list[dict | None] = [None]
+        display = self._tools.display_name(name) if self._tools else name
+
+        def _on_dismiss(choice: dict) -> None:
+            result[0] = choice
+            event.set()
+
+        def _show() -> None:
+            self.push_screen(ToolConfirmScreen(name, args, display), _on_dismiss)
+
+        self.call_from_thread(_show)
+        event.wait(timeout=120)
+        return result[0] or {"action": "deny"}
+
     # ----- 快捷键动作 -----
+
+    def _save_and_exit(self) -> None:
+        if self._messages and self._provider:
+            try:
+                from cli.memory import save_session_summary
+                import threading
+                t = threading.Thread(
+                    target=save_session_summary,
+                    args=(list(self._messages), self._provider),
+                    daemon=True,
+                )
+                t.start()
+                t.join(timeout=5)
+            except Exception:
+                pass
+        self.exit()
+
+    def action_quit(self) -> None:
+        self._save_and_exit()
 
     def action_smart_copy(self) -> None:
         """Ctrl+C: 有选中文本 → 复制；无选中 → 退出。"""
@@ -278,7 +425,7 @@ class WyckoffTUI(App):
             self.screen.clear_selection()
             self.notify("已复制", timeout=1)
         else:
-            self.exit()
+            self._save_and_exit()
 
     def action_switch_model(self) -> None:
         self._switch_model_selector()
@@ -397,7 +544,7 @@ class WyckoffTUI(App):
         log = self.query_one("#chat-log", ChatLog)
 
         if cmd in ("/quit", "/exit", "/q"):
-            self.exit()
+            self._save_and_exit()
         elif cmd == "/clear":
             self.action_clear_chat()
         elif cmd == "/new":
@@ -581,6 +728,8 @@ class WyckoffTUI(App):
             from cli.providers.fallback import FallbackProvider
             self._provider = FallbackProvider(configs, default_id)
         self._state.update(default_cfg)
+        if self._tools and self._provider:
+            self._tools.set_provider(self._provider)
         self._update_status()
 
     def _show_selector(self, options: list[tuple[str, str]], callback_id: str) -> None:
@@ -844,37 +993,22 @@ class WyckoffTUI(App):
         _chatlog_save = self._chatlog_save  # bound method ref
 
         try:
-            from cli.agent import MAX_TOOL_ROUNDS
+            from cli.loop_guard import MAX_TOOL_ROUNDS, check_doom_loop
 
-            _COMPACT_THRESHOLD = 12000  # ~12K tokens 触发压缩
-            _TAIL_KEEP = 4  # 保留最近 4 条消息原文
+            _model_name_for_compact = getattr(self._provider, "name", "") if self._provider else ""
 
             for round_idx in range(MAX_TOOL_ROUNDS):
                 # ── Context compaction ──
-                if len(self._messages) > _TAIL_KEEP + 2 and _estimate_tokens(self._messages) > _COMPACT_THRESHOLD:
-                    _spinner_start("压缩上下文")
-                    head = self._messages[:-_TAIL_KEEP]
-                    tail = self._messages[-_TAIL_KEEP:]
-                    head_text = "\n".join(
-                        f"[{m['role']}] {m.get('content', '') or json.dumps(m.get('tool_calls', []), ensure_ascii=False)[:200]}"
-                        for m in head
-                    )
-                    try:
-                        summary_chunks = list(self._provider.chat_stream(
-                            [{"role": "user", "content": head_text}],
-                            [],
-                            _COMPACTION_PROMPT,
-                        ))
-                        summary = "".join(c.get("text", "") for c in summary_chunks if c["type"] == "text_delta")
-                        if summary:
-                            self._messages = [{"role": "user", "content": f"[对话摘要]\n{summary}"},
-                                              {"role": "assistant", "content": "好的，我已了解之前的对话上下文，请继续。"}] + tail
-                            _write(Text.from_markup(
-                                f"  [dim]📦 上下文已压缩（{len(head)}条→摘要，保留最近{_TAIL_KEEP}条）[/dim]"
-                            ))
-                    except Exception:
-                        pass  # 压缩失败不影响主流程
-                    _spinner_stop()
+                _spinner_start("压缩上下文")
+                prev_len = len(self._messages)
+                self._messages, compacted = compact_messages(
+                    self._messages, self._provider, _model_name_for_compact,
+                )
+                _spinner_stop()
+                if compacted:
+                    _write(Text.from_markup(
+                        f"  [dim]📦 上下文已压缩（{prev_len - _TAIL_KEEP_DEFAULT}条→摘要，保留最近{_TAIL_KEEP_DEFAULT}条）[/dim]"
+                    ))
 
                 text_buf = ""
                 thinking_buf = ""
@@ -907,7 +1041,7 @@ class WyckoffTUI(App):
                 for _retry in range(_MAX_STREAM_RETRIES):
                     try:
                         _stream = self._provider.chat_stream(
-                            self._messages, self._tools.schemas(), self._system_prompt
+                            self._messages, self._tools.schemas(), with_current_time(self._system_prompt)
                         )
                         break
                     except Exception as _stream_err:
@@ -992,6 +1126,8 @@ class WyckoffTUI(App):
                     assistant_msg: dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
                     if text_buf:
                         assistant_msg["content"] = text_buf
+                    if thinking_buf:
+                        assistant_msg["reasoning_content"] = thinking_buf
                     self._messages.append(assistant_msg)
 
                     for call in tool_calls:
@@ -1002,11 +1138,7 @@ class WyckoffTUI(App):
                         used_tools_this_turn.append(name)
 
                         # ── Doom-loop 检测 ──
-                        args_hash = hash(json.dumps(args, sort_keys=True, ensure_ascii=False))
-                        _recent_calls.append((name, args_hash))
-                        if len(_recent_calls) > 6:
-                            _recent_calls.pop(0)
-                        if _recent_calls.count((name, args_hash)) >= 3:
+                        if check_doom_loop(_recent_calls, name, args):
                             _write(Text.from_markup(
                                 f"  [yellow]⚠ 检测到重复调用 {display}，已中止循环[/yellow]"
                             ))
@@ -1014,7 +1146,7 @@ class WyckoffTUI(App):
                                 "role": "tool", "tool_call_id": call_id, "name": name,
                                 "content": json.dumps({"error": "doom-loop: 同参数重复调用3次，已中止"}, ensure_ascii=False),
                             })
-                            tool_calls = None  # 跳出 tool loop, 不 continue 到下一轮
+                            tool_calls = None
                             break
 
                         _spinner_start(display)
@@ -1067,7 +1199,10 @@ class WyckoffTUI(App):
                     ))
                     _scroll()
                     if text_buf:
-                        self._messages.append({"role": "assistant", "content": text_buf})
+                        _retry_msg: dict[str, Any] = {"role": "assistant", "content": text_buf}
+                        if thinking_buf:
+                            _retry_msg["reasoning_content"] = thinking_buf
+                        self._messages.append(_retry_msg)
                     self._messages.append({"role": "user", "content": retry_prompt})
                     continue
 
@@ -1075,7 +1210,10 @@ class WyckoffTUI(App):
                 if missing_required_tool(expectation, used_tools_this_turn):
                     warning = build_retry_exhausted_warning(expectation, incomplete_tool_retries)
                     text_buf = f"{warning}\n\n{text_buf}".strip()
-                self._messages.append({"role": "assistant", "content": text_buf})
+                _final_msg: dict[str, Any] = {"role": "assistant", "content": text_buf}
+                if thinking_buf:
+                    _final_msg["reasoning_content"] = thinking_buf
+                self._messages.append(_final_msg)
                 if text_buf:
                     if not _streaming_started:
                         _write(Text.from_markup("  [dim]───[/dim]"))

@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Agent 核心循环 — 流式输出版本。
+Headless agent loop — 无 UI 依赖的 agent 循环。
 
-原理：
-    while True:
-        stream = llm.chat_stream(messages, tools)
-        逐 chunk 渲染文本 → 遇到 tool_calls → 执行 → 继续循环
+TUI 使用内联版本（与 Textual 渲染深度耦合），此模块为测试和非交互场景
+提供可独立运行的 agent loop，支持 Rich Live 流式渲染。
 """
 from __future__ import annotations
 
@@ -19,9 +17,13 @@ from rich.markdown import Markdown
 from rich.spinner import Spinner
 from rich.text import Text
 
+from cli.compaction import compact_messages
 from cli.loop_guard import (
+    MAX_INCOMPLETE_TOOL_RETRIES,
+    MAX_TOOL_ROUNDS,
     build_retry_exhausted_warning,
     build_retry_user_message,
+    check_doom_loop,
     missing_required_tool,
     resolve_turn_expectation,
 )
@@ -31,9 +33,6 @@ from cli.tools import ToolRegistry
 logger = logging.getLogger(__name__)
 
 _THINKING_TEXT = Text.from_markup("  [dim]思考中…[/dim]")
-
-MAX_TOOL_ROUNDS = 15
-MAX_INCOMPLETE_TOOL_RETRIES = 2
 
 
 def run(
@@ -58,8 +57,13 @@ def run(
     expectation = resolve_turn_expectation(messages)
     incomplete_tool_retries = 0
     used_tools_this_turn: list[str] = []
+    _recent_calls: list[tuple[str, int]] = []
+
+    _model_name = getattr(provider, "name", "")
 
     for round_idx in range(MAX_TOOL_ROUNDS):
+        messages, _ = compact_messages(messages, provider, _model_name)
+
         text_buf = ""
         thinking_buf = ""
         tool_calls = None
@@ -153,6 +157,8 @@ def run(
             assistant_msg: dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
             if text_buf:
                 assistant_msg["content"] = text_buf
+            if thinking_buf:
+                assistant_msg["reasoning_content"] = thinking_buf
             messages.append(assistant_msg)
 
             for call in tool_calls:
@@ -160,6 +166,15 @@ def run(
                 args = call["args"]
                 call_id = call["id"]
                 used_tools_this_turn.append(name)
+
+                if check_doom_loop(_recent_calls, name, args):
+                    logger.warning("doom-loop detected: %s", name)
+                    messages.append({
+                        "role": "tool", "tool_call_id": call_id, "name": name,
+                        "content": json.dumps({"error": "doom-loop: 同参数重复调用3次，已中止"}, ensure_ascii=False),
+                    })
+                    tool_calls = None
+                    break
 
                 if on_tool_call:
                     on_tool_call(name, args)
@@ -191,7 +206,10 @@ def run(
                 expectation.reason if expectation else "",
             )
             if text_buf:
-                messages.append({"role": "assistant", "content": text_buf})
+                _retry_msg: dict[str, Any] = {"role": "assistant", "content": text_buf}
+                if thinking_buf:
+                    _retry_msg["reasoning_content"] = thinking_buf
+                messages.append(_retry_msg)
             messages.append({"role": "user", "content": retry_prompt})
             if console:
                 console.print("  [yellow]⚠ 检测到模型未执行必需工具，已自动要求继续执行[/yellow]")
@@ -201,7 +219,10 @@ def run(
         if missing_required_tool(expectation, used_tools_this_turn):
             warning = build_retry_exhausted_warning(expectation, incomplete_tool_retries)
             text_buf = f"{warning}\n\n{text_buf}".strip()
-        messages.append({"role": "assistant", "content": text_buf})
+        _final_msg: dict[str, Any] = {"role": "assistant", "content": text_buf}
+        if thinking_buf:
+            _final_msg["reasoning_content"] = thinking_buf
+        messages.append(_final_msg)
         elapsed = time.monotonic() - t_start
         return {
             "text": text_buf,
