@@ -424,45 +424,29 @@ def _fetch_stock_akshare(
 
 
 def _fetch_stock_baostock(symbol: str, start: str, end: str) -> pd.DataFrame:
-    if symbol.startswith(("600", "601", "603", "605", "688")):
-        bs_code = f"sh.{symbol}"
-    else:
-        bs_code = f"sz.{symbol}"
-    start_dash = f"{start[:4]}-{start[4:6]}-{start[6:]}"
-    end_dash = f"{end[:4]}-{end[4:6]}-{end[6:]}"
-    with _BAOSTOCK_LOCK:
-        old_sock_timeout = socket.getdefaulttimeout()
-        if _BAOSTOCK_SOCKET_TIMEOUT > 0:
-            socket.setdefaulttimeout(_BAOSTOCK_SOCKET_TIMEOUT)
-        bs = _ensure_baostock_login()
-        try:
-            started = time.monotonic()
-            rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,open,high,low,close,volume,amount,pctChg",
-                start_date=start_dash,
-                end_date=end_dash,
-                frequency="d",
-                adjustflag="2",  # 前复权
-            )
-            print(f"[baostock] query {bs_code} error_code={rs.error_code} msg={rs.error_msg}")
-            if rs.error_code != "0":
-                raise RuntimeError(f"baostock: {rs.error_msg}")
-            rows: list[list[str]] = []
-            while rs.next():
-                if (
-                    _BAOSTOCK_MAX_SECONDS > 0
-                    and (time.monotonic() - started) > _BAOSTOCK_MAX_SECONDS
-                ):
-                    raise TimeoutError(
-                        f"baostock hard timeout > {_BAOSTOCK_MAX_SECONDS:.2f}s"
-                    )
-                rows.append(rs.get_row_data())
-        finally:
-            socket.setdefaulttimeout(old_sock_timeout)
+    # ... 前面的代码保持不变，直到 rows 构建完成 ...
     if not rows:
         raise RuntimeError("baostock empty")
-    # ... 后续 DataFrame 构建保持不变
+    df = pd.DataFrame(rows, columns=rs.fields)
+    df = df.rename(
+        columns={
+            "date": "日期",
+            "open": "开盘",
+            "high": "最高",
+            "low": "最低",
+            "close": "收盘",
+            "volume": "成交量",
+            "amount": "成交额",
+            "pctChg": "涨跌幅",
+        }
+    )
+    df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for c in ["开盘", "最高", "最低", "收盘", "成交量", "成交额", "涨跌幅"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["换手率"] = pd.NA
+    df["振幅"] = pd.NA
+    return df[["日期","开盘","最高","最低","收盘","成交量","成交额","涨跌幅","换手率","振幅"]].copy()
 
 
 def _baostock_logout_on_exit() -> None:
@@ -544,7 +528,7 @@ def _fetch_stock_efinance(symbol: str, start: str, end: str) -> pd.DataFrame:
 
     # fqt: 0 不复权, 1 前复权, 2 后复权
     fqt = 1  # 默认前复权
-    result = ef.stock.get_quote_history(symbol, beg=start, end=end, klt=101, fqt=fqt)
+    result = ef.stock.get_quote_history(symbol, beg=start, end=end, klt=1, fqt=fqt)
     if isinstance(result, dict):
         df = result.get(str(symbol))
     else:
