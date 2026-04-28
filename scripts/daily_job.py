@@ -33,6 +33,26 @@ from integrations.supabase_recommendation import (
 from utils.trading_clock import resolve_end_calendar_day
 
 TZ = ZoneInfo("Asia/Shanghai")
+class TickFlowClient:
+    def __init__(self):
+        self.base_url = os.getenv("TICKFLOW_BASE_URL", "https://free-api.tickflow.org")
+        self.api_key = os.getenv("TICKFLOW_API_KEY")
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+
+    def get_index_daily(self, symbol: str, start_date: str = None, end_date: str = None, limit: int = 1):
+        url = f"{self.base_url}/market/index/daily"
+        params = {"symbol": symbol, "limit": limit}
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        resp = self.session.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise Exception(f"TickFlow API error: {data.get('msg')}")
+        return data["data"]
 STEP3_REASON_MAP = {
     "data_all_failed": "OHLCV 全部拉取失败",
     "llm_failed": "大模型调用失败",
