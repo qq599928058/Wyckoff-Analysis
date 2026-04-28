@@ -424,7 +424,42 @@ def _fetch_stock_akshare(
 
 
 def _fetch_stock_baostock(symbol: str, start: str, end: str) -> pd.DataFrame:
-    # ... 前面的代码保持不变，直到 rows 构建完成 ...
+    if symbol.startswith(("600", "601", "603", "605", "688")):
+        bs_code = f"sh.{symbol}"
+    else:
+        bs_code = f"sz.{symbol}"
+    start_dash = f"{start[:4]}-{start[4:6]}-{start[6:]}"
+    end_dash = f"{end[:4]}-{end[4:6]}-{end[6:]}"
+    with _BAOSTOCK_LOCK:
+        old_sock_timeout = socket.getdefaulttimeout()
+        if _BAOSTOCK_SOCKET_TIMEOUT > 0:
+            socket.setdefaulttimeout(_BAOSTOCK_SOCKET_TIMEOUT)
+        bs = _ensure_baostock_login()
+        try:
+            started = time.monotonic()
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume,amount,pctChg",
+                start_date=start_dash,
+                end_date=end_dash,
+                frequency="d",
+                adjustflag="2",  # 前复权
+            )
+            print(f"[baostock] query {bs_code} error_code={rs.error_code} msg={rs.error_msg}")
+            if rs.error_code != "0":
+                raise RuntimeError(f"baostock: {rs.error_msg}")
+            rows: list[list[str]] = []
+            while rs.next():
+                if (
+                    _BAOSTOCK_MAX_SECONDS > 0
+                    and (time.monotonic() - started) > _BAOSTOCK_MAX_SECONDS
+                ):
+                    raise TimeoutError(
+                        f"baostock hard timeout > {_BAOSTOCK_MAX_SECONDS:.2f}s"
+                    )
+                rows.append(rs.get_row_data())
+        finally:
+            socket.setdefaulttimeout(old_sock_timeout)
     if not rows:
         raise RuntimeError("baostock empty")
     df = pd.DataFrame(rows, columns=rs.fields)
@@ -831,7 +866,10 @@ def fetch_stock_hist(
         except Exception as e:
             print(f"[data_source] akshare failed for {symbol}: {e}")
 
-    raise RuntimeError(f"所有数据源均无法获取 {symbol} 日线数据")
+    raise RuntimeError(
+    f"所有数据源均无法获取 {symbol} 日线数据。"
+    f"参考降级链顺序：tickflow→tushare→akshare→baostock→efinance"
+)
 
 
 # --- 大盘指数 ---
