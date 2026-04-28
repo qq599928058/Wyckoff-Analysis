@@ -791,234 +791,66 @@ def fetch_stock_hist(
     end: str | date,
     adjust: Literal["", "qfq", "hfq"] = "qfq",
 ) -> pd.DataFrame:
-    """
-    个股日线：tickflow 优先（固定 qfq），失败时回退 tushare/akshare/baostock/efinance。
-    可用环境变量按需禁用数据源：
-    - DATA_SOURCE_DISABLE_TICKFLOW=1
-    - DATA_SOURCE_DISABLE_AKSHARE=1
-    - DATA_SOURCE_DISABLE_BAOSTOCK=1
-    - DATA_SOURCE_DISABLE_EFINANCE=1
-    返回列：日期, 开盘, 最高, 最低, 收盘, 成交量, 成交额, 涨跌幅, 换手率, 振幅
-    """
-    start_s = (
-        start.strftime("%Y%m%d")
-        if isinstance(start, date)
-        else str(start).replace("-", "")
-    )
-    end_s = (
-        end.strftime("%Y%m%d") if isinstance(end, date) else str(end).replace("-", "")
-    )
+    start_s = start.strftime("%Y%m%d") if isinstance(start, date) else str(start).replace("-", "")
+    end_s   = end.strftime("%Y%m%d")   if isinstance(end,   date) else str(end).replace("-", "")
 
-    failed_sources: list[str] = []
-    failed_details: list[str] = []
-    tickflow_limit_notices: list[str] = []
-    tickflow_failed = False
-    disable_akshare = os.getenv("DATA_SOURCE_DISABLE_AKSHARE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    disable_tickflow = os.getenv("DATA_SOURCE_DISABLE_TICKFLOW", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    disable_baostock = os.getenv("DATA_SOURCE_DISABLE_BAOSTOCK", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    disable_efinance = os.getenv("DATA_SOURCE_DISABLE_EFINANCE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    disable_baostock = os.getenv("DATA_SOURCE_DISABLE_BAOSTOCK", "").strip().lower() in {"1","true","yes","on"}
+    disable_efinance = os.getenv("DATA_SOURCE_DISABLE_EFINANCE", "").strip().lower() in {"1","true","yes","on"}
+    disable_tickflow = os.getenv("DATA_SOURCE_DISABLE_TICKFLOW", "").strip().lower() in {"1","true","yes","on"}
+    disable_akshare  = os.getenv("DATA_SOURCE_DISABLE_AKSHARE", "").strip().lower() in {"1","true","yes","on"}
 
-    # 1. tickflow 优先（固定 qfq）
-    if disable_tickflow:
-        failed_sources.append("tickflow(disabled)")
-        failed_details.append("tickflow=disabled_by_env")
-    elif not os.getenv("TICKFLOW_API_KEY", "").strip():
-        failed_sources.append("tickflow(unconfigured)")
-        failed_details.append("tickflow=api_key_missing(购买: https://tickflow.org/auth/register?ref=5N4NKTCPL4)")
-    else:
-        try:
-            return _tag_source(
-                _fetch_stock_tickflow(symbol, start_s, end_s, adjust),
-                "tickflow",
-            )
-        except Exception as e:
-            tickflow_failed = True
-            _debug_source_fail("tickflow", e)
-            failed_sources.append("tickflow")
-            failed_details.append(f"tickflow={_compact_error(e)}")
-            if is_tickflow_rate_limited_error(e):
-                record_tickflow_limit_event(e)
-                tickflow_limit_notices.append(TICKFLOW_LIMIT_HINT)
-                failed_details.append(f"tickflow_limit_hint={TICKFLOW_LIMIT_HINT}")
-                print(
-                    f"[data_source] tickflow限流触发: symbol={symbol}, range={start_s}..{end_s}, "
-                    f"fallback_chain=tushare->akshare->baostock->efinance",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[data_source] tickflow失败，将回退: symbol={symbol}, range={start_s}..{end_s}, "
-                    f"err={_compact_error(e)}",
-                    flush=True,
-                )
-
-    # 2) tushare 次优先（固定 qfq）
-    from integrations.tushare_client import get_pro
-
-    pro = get_pro()
-    if pro is not None:
-        try:
-            out = _tag_source(
-                _attach_tickflow_limit_notices(
-                    _fetch_stock_tushare(symbol, start_s, end_s, "qfq"),
-                    tickflow_limit_notices,
-                ),
-                "tushare",
-            )
-            if tickflow_failed:
-                print(
-                    f"[data_source] fallback命中: symbol={symbol}, source=tushare, "
-                    f"tickflow_limit_hint={bool(tickflow_limit_notices)}",
-                    flush=True,
-                )
-            return out
-        except Exception as e:
-            _debug_source_fail("tushare", e)
-            failed_sources.append("tushare")
-            failed_details.append(f"tushare={_compact_error(e)}")
-    else:
-        failed_sources.append("tushare(unconfigured)")
-        failed_details.append("tushare=token_missing")
-
-    # 3. akshare
-    if disable_akshare:
-        failed_sources.append("akshare(disabled)")
-        failed_details.append("akshare=disabled_by_env")
-    else:
-        last_akshare_err: Exception | None = None
-        for attempt in range(1, _AKSHARE_RETRY_TIMES + 1):
-            try:
-                out = _tag_source(
-                    _attach_tickflow_limit_notices(
-                        _fetch_stock_akshare(symbol, start_s, end_s, adjust),
-                        tickflow_limit_notices,
-                    ),
-                    "akshare",
-                )
-                if tickflow_failed:
-                    print(
-                        f"[data_source] fallback命中: symbol={symbol}, source=akshare, "
-                        f"tickflow_limit_hint={bool(tickflow_limit_notices)}",
-                        flush=True,
-                    )
-                return out
-            except ModuleNotFoundError as e:
-                _debug_source_fail("akshare", e)
-                failed_sources.append(f"akshare(缺少依赖 {e.name})")
-                failed_details.append(f"akshare={_compact_error(e)}")
-                last_akshare_err = e
-                break
-            except Exception as e:
-                last_akshare_err = e
-                _debug_source_fail("akshare", e)
-                if attempt < _AKSHARE_RETRY_TIMES and _is_retryable_akshare_error(e):
-                    time.sleep(max(_AKSHARE_RETRY_SLEEP_SECONDS, 0.0))
-                    continue
-                failed_sources.append("akshare")
-                failed_details.append(f"akshare={_compact_error(e)}")
-                break
-
-    # 4. baostock (仅前复权)
-    baostock_circuit_open, baostock_circuit_note = _baostock_circuit_state()
-    if disable_baostock:
-        failed_sources.append("baostock(disabled)")
-        failed_details.append("baostock=disabled_by_env")
-    elif baostock_circuit_open:
-        note = baostock_circuit_note or "circuit_open"
-        failed_sources.append("baostock(circuit_open)")
-        failed_details.append(f"baostock={note}")
-    else:
-        started = time.monotonic()
+    # 1) baostock (无 token，国内友好)
+    if not disable_baostock:
         try:
             df = _fetch_stock_baostock(symbol, start_s, end_s)
-            elapsed = time.monotonic() - started
-            if _BAOSTOCK_MAX_SECONDS > 0 and elapsed > _BAOSTOCK_MAX_SECONDS:
-                raise TimeoutError(
-                    f"baostock slow={elapsed:.2f}s > {_BAOSTOCK_MAX_SECONDS:.2f}s"
-                )
-            _baostock_mark_success()
-            out = _tag_source(
-                _attach_tickflow_limit_notices(df, tickflow_limit_notices),
-                "baostock",
-            )
-            if tickflow_failed:
-                print(
-                    f"[data_source] fallback命中: symbol={symbol}, source=baostock, "
-                    f"tickflow_limit_hint={bool(tickflow_limit_notices)}",
-                    flush=True,
-                )
-            return out
-        except ModuleNotFoundError as e:
-            _debug_source_fail("baostock", e)
-            _baostock_mark_failure(_compact_error(e))
-            failed_sources.append(f"baostock(未安装: {e.name})")
-            failed_details.append(f"baostock={_compact_error(e)}")
+            if df is not None and not df.empty:
+                print(f"[data_source] baostock success: {symbol}")
+                return _tag_source(df, "baostock")
         except Exception as e:
-            _debug_source_fail("baostock", e)
-            _baostock_mark_failure(_compact_error(e))
-            failed_sources.append("baostock")
-            failed_details.append(f"baostock={_compact_error(e)}")
+            print(f"[data_source] baostock failed for {symbol}: {e}")
 
-    # 5. efinance (仅前复权)
-    if disable_efinance:
-        failed_sources.append("efinance(disabled)")
-        failed_details.append("efinance=disabled_by_env")
-    else:
+    # 2) efinance (无 token)
+    if not disable_efinance:
         try:
-            out = _tag_source(
-                _attach_tickflow_limit_notices(
-                    _fetch_stock_efinance(symbol, start_s, end_s),
-                    tickflow_limit_notices,
-                ),
-                "efinance",
-            )
-            if tickflow_failed:
-                print(
-                    f"[data_source] fallback命中: symbol={symbol}, source=efinance, "
-                    f"tickflow_limit_hint={bool(tickflow_limit_notices)}",
-                    flush=True,
-                )
-            return out
-        except ModuleNotFoundError as e:
-            _debug_source_fail("efinance", e)
-            failed_sources.append(f"efinance(未安装: {e.name})")
-            failed_details.append(f"efinance={_compact_error(e)}")
+            df = _fetch_stock_efinance(symbol, start_s, end_s)
+            if df is not None and not df.empty:
+                print(f"[data_source] efinance success: {symbol}")
+                return _tag_source(df, "efinance")
         except Exception as e:
-            _debug_source_fail("efinance", e)
-            failed_sources.append("efinance")
-            failed_details.append(f"efinance={_compact_error(e)}")
+            print(f"[data_source] efinance failed for {symbol}: {e}")
 
-    detail_suffix = (
-        f" 失败详情：{'；'.join(failed_details[:4])}。"
-        if failed_details
-        else ""
-    )
-    hint = _network_hint_from_details(failed_details)
-    hint_suffix = f" 诊断提示：{hint}" if hint else ""
-    raise RuntimeError(
-        f"数据拉取全线失败 [标:{symbol}, 范围:{start_s}..{end_s}, 复权:{adjust}]：已按顺序尝试 tickflow→tushare→akshare→baostock→efinance，"
-        f"均无可用 K 线数据。请检查该标的是否已退市或处于长期停牌期。{detail_suffix}{hint_suffix}"
-    )
+    # 3) tickflow (可选，需 token)
+    if not disable_tickflow and os.getenv("TICKFLOW_API_KEY", "").strip():
+        try:
+            df = _fetch_stock_tickflow(symbol, start_s, end_s, adjust)
+            if df is not None and not df.empty:
+                print(f"[data_source] tickflow success: {symbol}")
+                return _tag_source(df, "tickflow")
+        except Exception as e:
+            print(f"[data_source] tickflow failed for {symbol}: {e}")
+
+    # 4) tushare (需 token)
+    from integrations.tushare_client import get_pro
+    if get_pro() is not None:
+        try:
+            df = _fetch_stock_tushare(symbol, start_s, end_s, adjust)
+            if df is not None and not df.empty:
+                print(f"[data_source] tushare success: {symbol}")
+                return _tag_source(df, "tushare")
+        except Exception as e:
+            print(f"[data_source] tushare failed for {symbol}: {e}")
+
+    # 5) akshare (最后降级)
+    if not disable_akshare:
+        try:
+            df = _fetch_stock_akshare(symbol, start_s, end_s, adjust)
+            if df is not None and not df.empty:
+                print(f"[data_source] akshare success: {symbol}")
+                return _tag_source(df, "akshare")
+        except Exception as e:
+            print(f"[data_source] akshare failed for {symbol}: {e}")
+
+    raise RuntimeError(f"所有数据源均无法获取 {symbol} 日线数据")
 
 
 # --- 大盘指数 ---
