@@ -770,13 +770,16 @@ def fetch_stock_hist(
     disable_tickflow = os.getenv("DATA_SOURCE_DISABLE_TICKFLOW", "").strip().lower() in {"1","true","yes","on"}
     disable_akshare  = os.getenv("DATA_SOURCE_DISABLE_AKSHARE", "").strip().lower() in {"1","true","yes","on"}
 
-    # 1) baostock (优先，无需Token)
+    limit_notices: list[str] = []   # 收集限流提示
+
+    # 1) baostock
     if not disable_baostock:
         try:
             df = _fetch_stock_baostock(symbol, start_s, end_s)
             if df is not None and not df.empty:
                 print(f"[data_source] baostock success: {symbol}")
-                return _tag_source(df, "baostock")
+                df = _tag_source(df, "baostock")
+                return _attach_tickflow_limit_notices(df, limit_notices)
         except Exception as e:
             print(f"[data_source] baostock failed for {symbol}: {type(e).__name__}: {e}")
 
@@ -786,19 +789,24 @@ def fetch_stock_hist(
             df = _fetch_stock_efinance(symbol, start_s, end_s)
             if df is not None and not df.empty:
                 print(f"[data_source] efinance success: {symbol}")
-                return _tag_source(df, "efinance")
+                df = _tag_source(df, "efinance")
+                return _attach_tickflow_limit_notices(df, limit_notices)
         except Exception as e:
             print(f"[data_source] efinance failed for {symbol}: {type(e).__name__}: {e}")
 
-    # 3) tickflow（默认禁用，如果想用则设置环境变量启用）
+    # 3) tickflow（可选）
     if not disable_tickflow and os.getenv("TICKFLOW_API_KEY", "").strip():
         try:
             df = _fetch_stock_tickflow(symbol, start_s, end_s, adjust)
             if df is not None and not df.empty:
                 print(f"[data_source] tickflow success: {symbol}")
-                return _tag_source(df, "tickflow")
+                df = _tag_source(df, "tickflow")
+                return _attach_tickflow_limit_notices(df, limit_notices)
         except Exception as e:
             print(f"[data_source] tickflow failed for {symbol}: {e}")
+            if is_tickflow_rate_limited_error(e):
+                limit_notices.append(TICKFLOW_LIMIT_HINT)
+                record_tickflow_limit_event(e)
 
     # 4) tushare
     from integrations.tushare_client import get_pro
@@ -807,17 +815,19 @@ def fetch_stock_hist(
             df = _fetch_stock_tushare(symbol, start_s, end_s, adjust)
             if df is not None and not df.empty:
                 print(f"[data_source] tushare success: {symbol}")
-                return _tag_source(df, "tushare")
+                df = _tag_source(df, "tushare")
+                return _attach_tickflow_limit_notices(df, limit_notices)
         except Exception as e:
             print(f"[data_source] tushare failed for {symbol}: {e}")
 
-    # 5) akshare（最后备用）
+    # 5) akshare
     if not disable_akshare:
         try:
             df = _fetch_stock_akshare(symbol, start_s, end_s, adjust)
             if df is not None and not df.empty:
                 print(f"[data_source] akshare success: {symbol}")
-                return _tag_source(df, "akshare")
+                df = _tag_source(df, "akshare")
+                return _attach_tickflow_limit_notices(df, limit_notices)
         except Exception as e:
             print(f"[data_source] akshare failed for {symbol}: {e}")
 
