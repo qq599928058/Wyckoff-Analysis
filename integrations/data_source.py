@@ -1076,38 +1076,119 @@ def _fetch_index_akshare(code: str, start: str, end: str) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df[["date", "open", "high", "low", "close", "volume", "pct_chg"]].copy()
+    
+def _fetch_index_baostock(code: str, start: str, end: str) -> pd.DataFrame:
+    """通过 baostock 获取指数日线（代码如 '000001' 或 '399006'）"""
+    import baostock as bs
+    # 转换代码：上证指数 sh.000001，深证指数 sz.399006
+    if code.startswith(("000", "880", "899")):
+        bs_code = f"sh.{code}"
+    else:
+        bs_code = f"sz.{code}"
+    start_dash = f"{start[:4]}-{start[4:6]}-{start[6:]}"
+    end_dash = f"{end[:4]}-{end[4:6]}-{end[6:]}"
+    with _BAOSTOCK_LOCK:
+        bs = _ensure_baostock_login()
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,open,high,low,close,volume,pctChg",
+            start_date=start_dash,
+            end_date=end_dash,
+            frequency="d",
+            adjustflag="2"  # 前复权
+        )
+        if rs.error_code != "0":
+            raise RuntimeError(f"baostock index: {rs.error_msg}")
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+    if not rows:
+        raise RuntimeError("baostock index empty")
+    df = pd.DataFrame(rows, columns=rs.fields)
+    df = df.rename(columns={
+        "date": "date",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "volume": "volume",
+        "pctChg": "pct_chg",
+    })
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    for c in ["open","high","low","close","volume","pct_chg"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df[["date","open","high","low","close","volume","pct_chg"]].copy()
 
+def _fetch_index_efinance(code: str, start: str, end: str) -> pd.DataFrame:
+    """通过 efinance 获取指数日线（代码如 '000001' 或 '399006'）"""
+    import efinance as ef
+    # efinance 指数代码需要加后缀：sh000001, sz399006
+    if code.startswith(("000", "880", "899")):
+        ef_code = f"sh{code}"
+    else:
+        ef_code = f"sz{code}"
+    start_dash = f"{start[:4]}-{start[4:6]}-{start[6:]}"
+    end_dash = f"{end[:4]}-{end[4:6]}-{end[6:]}"
+    df = ef.stock.get_quote_history(ef_code, beg=start_dash, end=end_dash)
+    if df is None or df.empty:
+        raise RuntimeError("efinance index empty")
+    # 统一列名
+    df = df.rename(columns={
+        "日期": "date",
+        "开盘": "open",
+        "最高": "high",
+        "最低": "low",
+        "收盘": "close",
+        "成交量": "volume",
+        "涨跌幅": "pct_chg",
+    })
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    return df[["date","open","high","low","close","volume","pct_chg"]].copy()
 
 def fetch_index_hist(code: str, start: str | date, end: str | date) -> pd.DataFrame:
     """
-    大盘指数日线：tushare 优先，失败时 fallback 到 akshare。
-    返回列：date, open, high, low, close, volume, pct_chg（小写，供 step2 使用）
+    大盘指数日线：baostock → efinance → tushare → akshare
+    返回列：date, open, high, low, close, volume, pct_chg
     """
-    start_s = (
-        start.strftime("%Y%m%d")
-        if isinstance(start, date)
-        else str(start).replace("-", "")
-    )
-    end_s = (
-        end.strftime("%Y%m%d") if isinstance(end, date) else str(end).replace("-", "")
-    )
+    start_s = start.strftime("%Y%m%d") if isinstance(start, date) else str(start).replace("-", "")
+    end_s   = end.strftime("%Y%m%d")   if isinstance(end,   date) else str(end).replace("-", "")
 
-    # 1) tushare 优先
-    try:
-        return _fetch_index_tushare(code, start_s, end_s)
-    except Exception as e:
-        _debug_source_fail("tushare(index)", e)
+    # 读取环境变量，允许手动禁用某些源
+    disable_baostock = os.getenv("DATA_SOURCE_DISABLE_BAOSTOCK", "").strip().lower() in {"1","true","yes","on"}
+    disable_efinance = os.getenv("DATA_SOURCE_DISABLE_EFINANCE", "").strip().lower() in {"1","true","yes","on"}
+    disable_tushare  = os.getenv("DATA_SOURCE_DISABLE_TUSHARE", "").strip().lower() in {"1","true","yes","on"}
 
-    # 2) akshare fallback
+    # 1) baostock
+    if not disable_baostock:
+        try:
+            return _fetch_index_baostock(code, start_s, end_s)
+        except Exception as e:
+            _debug_source_fail("baostock(index)", e)
+
+    # 2) efinance
+    if not disable_efinance:
+        try:
+            return _fetch_index_efinance(code, start_s, end_s)
+        except Exception as e:
+            _debug_source_fail("efinance(index)", e)
+
+    # 3) tushare
+    if not disable_tushare:
+        try:
+            return _fetch_index_tushare(code, start_s, end_s)
+        except Exception as e:
+            _debug_source_fail("tushare(index)", e)
+
+    # 4) akshare（最后降级）
     try:
         return _fetch_index_akshare(code, start_s, end_s)
-    except Exception as e2:
-        _debug_source_fail("akshare(index)", e2)
+    except Exception as e:
+        _debug_source_fail("akshare(index)", e)
 
     raise RuntimeError(
-        f"大盘指数 {code} 拉取全部失败（tushare + akshare），请检查 TUSHARE_TOKEN 或网络连通性。"
+        f"大盘指数 {code} 拉取全部失败（baostock→efinance→tushare→akshare），"
+        "请检查网络或考虑设置 TUSHARE_TOKEN。"
     )
-
 
 # --- 行业 & 市值批量获取（tushare） ---
 
