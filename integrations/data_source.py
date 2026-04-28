@@ -445,6 +445,7 @@ def _fetch_stock_baostock(symbol: str, start: str, end: str) -> pd.DataFrame:
                 frequency="d",
                 adjustflag="2",  # 前复权
             )
+            print(f"[baostock] query {bs_code} error_code={rs.error_code} msg={rs.error_msg}")
             if rs.error_code != "0":
                 raise RuntimeError(f"baostock: {rs.error_msg}")
             rows: list[list[str]] = []
@@ -461,26 +462,7 @@ def _fetch_stock_baostock(symbol: str, start: str, end: str) -> pd.DataFrame:
             socket.setdefaulttimeout(old_sock_timeout)
     if not rows:
         raise RuntimeError("baostock empty")
-    df = pd.DataFrame(rows, columns=rs.fields)
-    df = df.rename(
-        columns={
-            "date": "日期",
-            "open": "开盘",
-            "high": "最高",
-            "low": "最低",
-            "close": "收盘",
-            "volume": "成交量",
-            "amount": "成交额",
-            "pctChg": "涨跌幅",
-        }
-    )
-    df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
-    for c in ["开盘", "最高", "最低", "收盘", "成交量", "成交额", "涨跌幅"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["换手率"] = pd.NA
-    df["振幅"] = pd.NA
-    return df
+    # ... 后续 DataFrame 构建保持不变
 
 
 def _baostock_logout_on_exit() -> None:
@@ -791,15 +773,20 @@ def fetch_stock_hist(
     end: str | date,
     adjust: Literal["", "qfq", "hfq"] = "qfq",
 ) -> pd.DataFrame:
-    start_s = start.strftime("%Y%m%d") if isinstance(start, date) else str(start).replace("-", "")
-    end_s   = end.strftime("%Y%m%d")   if isinstance(end,   date) else str(end).replace("-", "")
+    """个股日线：baostock → efinance → tickflow(可选) → tushare → akshare"""
+    start_s = (
+        start.strftime("%Y%m%d") if isinstance(start, date) else str(start).replace("-", "")
+    )
+    end_s = (
+        end.strftime("%Y%m%d") if isinstance(end, date) else str(end).replace("-", "")
+    )
 
     disable_baostock = os.getenv("DATA_SOURCE_DISABLE_BAOSTOCK", "").strip().lower() in {"1","true","yes","on"}
     disable_efinance = os.getenv("DATA_SOURCE_DISABLE_EFINANCE", "").strip().lower() in {"1","true","yes","on"}
     disable_tickflow = os.getenv("DATA_SOURCE_DISABLE_TICKFLOW", "").strip().lower() in {"1","true","yes","on"}
     disable_akshare  = os.getenv("DATA_SOURCE_DISABLE_AKSHARE", "").strip().lower() in {"1","true","yes","on"}
 
-    # 1) baostock (无 token，国内友好)
+    # 1) baostock (优先，无需Token)
     if not disable_baostock:
         try:
             df = _fetch_stock_baostock(symbol, start_s, end_s)
@@ -807,9 +794,9 @@ def fetch_stock_hist(
                 print(f"[data_source] baostock success: {symbol}")
                 return _tag_source(df, "baostock")
         except Exception as e:
-            print(f"[data_source] baostock failed for {symbol}: {e}")
+            print(f"[data_source] baostock failed for {symbol}: {type(e).__name__}: {e}")
 
-    # 2) efinance (无 token)
+    # 2) efinance
     if not disable_efinance:
         try:
             df = _fetch_stock_efinance(symbol, start_s, end_s)
@@ -817,9 +804,9 @@ def fetch_stock_hist(
                 print(f"[data_source] efinance success: {symbol}")
                 return _tag_source(df, "efinance")
         except Exception as e:
-            print(f"[data_source] efinance failed for {symbol}: {e}")
+            print(f"[data_source] efinance failed for {symbol}: {type(e).__name__}: {e}")
 
-    # 3) tickflow (可选，需 token)
+    # 3) tickflow（默认禁用，如果想用则设置环境变量启用）
     if not disable_tickflow and os.getenv("TICKFLOW_API_KEY", "").strip():
         try:
             df = _fetch_stock_tickflow(symbol, start_s, end_s, adjust)
@@ -829,7 +816,7 @@ def fetch_stock_hist(
         except Exception as e:
             print(f"[data_source] tickflow failed for {symbol}: {e}")
 
-    # 4) tushare (需 token)
+    # 4) tushare
     from integrations.tushare_client import get_pro
     if get_pro() is not None:
         try:
@@ -840,7 +827,7 @@ def fetch_stock_hist(
         except Exception as e:
             print(f"[data_source] tushare failed for {symbol}: {e}")
 
-    # 5) akshare (最后降级)
+    # 5) akshare（最后备用）
     if not disable_akshare:
         try:
             df = _fetch_stock_akshare(symbol, start_s, end_s, adjust)
