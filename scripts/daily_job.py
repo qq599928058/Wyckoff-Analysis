@@ -35,7 +35,7 @@ from utils.trading_clock import resolve_end_calendar_day
 TZ = ZoneInfo("Asia/Shanghai")
 class TickFlowClient:
     def __init__(self):
-        self.base_url = os.getenv("TICKFLOW_BASE_URL", "https://free-api.tickflow.org")
+        self.base_url = os.getenv("TICKFLOW_BASE_URL", "https://api.tickflow.org")
         self.api_key = os.getenv("TICKFLOW_API_KEY")
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
