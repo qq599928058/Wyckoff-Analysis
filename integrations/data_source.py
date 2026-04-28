@@ -4,7 +4,7 @@
 # 商业授权请联系作者支付授权费用。
 
 """
-统一数据源：个股日线 tickflow 优先（qfq）→ tushare → akshare→baostock→efinance；大盘 tushare 直连
+统一数据源：个股日线 baostock -> efinance -> tickflow(可选) -> tushare -> akshare
 
 输出格式与 akshare 兼容：日期, 开盘, 最高, 最低, 收盘, 成交量, 成交额, 涨跌幅, 换手率, 振幅
 """
