@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
+      HTTP_PROXY_URL: ${{ secrets.HTTP_PROXY_URL }}
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
       TICKFLOW_BASE_URL: ${{ secrets.TICKFLOW_BASE_URL }}
