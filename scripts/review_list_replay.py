@@ -134,6 +134,35 @@ def _find_big_gainers(
     return codes
 
 
+def _find_big_gainers_from_spot(
+    spot_map: dict[str, dict],
+    name_map: dict[str, str],
+    threshold: float = 8.0,
+) -> tuple[list[str], int]:
+    """从全市场实时快照中找出涨幅 >= threshold% 的主板+创业板非ST股票。"""
+    codes: list[str] = []
+    usable = 0
+    for code, snap in (spot_map or {}).items():
+        code = str(code).strip()
+        if code not in name_map:
+            continue
+        if not _is_main_or_chinext(code):
+            continue
+        if "ST" in str(name_map.get(code, "")).upper():
+            continue
+        try:
+            pct = snap.get("pct_chg") if isinstance(snap, dict) else None
+            if pct is None:
+                continue
+            usable += 1
+            if float(pct) >= threshold:
+                codes.append(code)
+        except Exception:
+            continue
+    codes.sort()
+    return codes, usable
+
+
 def _blocked_exit_signal_map(exit_signals: dict[str, dict] | None) -> dict[str, dict]:
     blocked: dict[str, dict] = {}
     for code, raw in (exit_signals or {}).items():
@@ -179,30 +208,59 @@ def main() -> int:
 
     # 1. 先获取今日涨幅 ≥ 8% 的股票（使用今日数据）
     print("[review] 获取今日涨幅 ≥ 8% 股票...")
-    from utils.data_loader import load_daily_data
     from utils.trading_clock import resolve_end_calendar_day
+    from integrations.fetch_a_share_csv import _resolve_trading_window, get_stocks_by_board
     from datetime import timedelta
     
-    today = resolve_end_calendar_day()
+    end_calendar_day = resolve_end_calendar_day()
+    today_window = _resolve_trading_window(end_calendar_day=end_calendar_day, trading_days=1)
+    today = today_window.end_trade_date
     yesterday = today - timedelta(days=1)
     
     # 获取今日数据找涨停股
     print(f"[review] 今日: {today}, 前一日: {yesterday}")
-    from utils.data_loader import get_all_stock_codes
-    all_codes = get_all_stock_codes()
-    
-    today_df_map = {}
-    for code in all_codes:
-        try:
-            df = load_daily_data(code, start_date=today.strftime("%Y%m%d"), end_date=today.strftime("%Y%m%d"))
-            if df is not None and not df.empty:
-                today_df_map[code] = df
-        except Exception:
-            pass
-    
-    from utils.data_loader import get_stock_name_map
-    name_map_today = get_stock_name_map()
-    review_codes = _find_big_gainers(today_df_map, name_map_today, threshold=8.0)
+    stock_items = get_stocks_by_board("main_chinext")
+    name_map_today = {
+        str(item.get("code", "")).strip(): str(item.get("name", "")).strip()
+        for item in stock_items
+        if isinstance(item, dict) and str(item.get("code", "")).strip()
+    }
+    all_codes = sorted(name_map_today.keys())
+    review_codes: list[str] = []
+    spot_usable = 0
+    try:
+        from integrations.data_source import _load_spot_snapshot_map
+
+        spot_map = _load_spot_snapshot_map(force_refresh=True)
+        review_codes, spot_usable = _find_big_gainers_from_spot(
+            spot_map=spot_map,
+            name_map=name_map_today,
+            threshold=8.0,
+        )
+        print(
+            "[review] 实时快照加载完成: "
+            f"symbols={len(spot_map or {})}, usable_pct={spot_usable}, "
+            f"big_gainers={len(review_codes)}"
+        )
+    except Exception as e:
+        print(f"[review] 实时快照加载失败，准备回退日线拉取: {e}")
+
+    if spot_usable <= 0:
+        from tools.data_fetcher import fetch_all_ohlcv
+
+        print("[review] 实时快照不可用，回退到一日 OHLCV 拉取")
+        today_df_map, today_fetch_stats = fetch_all_ohlcv(
+            symbols=all_codes,
+            window=today_window,
+            enforce_target_trade_date=True,
+        )
+        print(
+            "[review] 今日数据拉取完成: "
+            f"ok={today_fetch_stats.get('fetch_ok', len(today_df_map))}, "
+            f"fail={today_fetch_stats.get('fetch_fail', 0)}, "
+            f"target_trade_date={today_window.end_trade_date}"
+        )
+        review_codes = _find_big_gainers(today_df_map, name_map_today, threshold=8.0)
     
     if not review_codes:
         print("[review] 今日无涨幅 ≥ 8% 的股票，跳过")
@@ -212,7 +270,6 @@ def main() -> int:
 
     # 2. 回放前一日漏斗（使用前一日数据）
     print(f"[review] 回放前一日 ({yesterday}) 漏斗...")
-    import os
     original_end_day = os.getenv("END_CALENDAR_DAY", "")
     os.environ["END_CALENDAR_DAY"] = yesterday.strftime("%Y-%m-%d")
     

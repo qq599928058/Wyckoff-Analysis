@@ -430,6 +430,24 @@ def run_funnel_job(
     # L4 需要 l2_df_map，这里直接用 all_df_map 即可，因为 key 都在里面
     triggers = layer4_triggers(l3_passed, all_df_map, cfg)
 
+    # L2 旁路观察池：L1通过 + L2被拒 + 在热门板块 + 有L4原始触发
+    l2_rejected = [s for s in l1_passed if s not in set(l2_passed)]
+    l2_bypass_in_sector = [
+        s for s in l2_rejected
+        if str(sector_map.get(s, "")).strip() in set(top_sectors)
+    ] if top_sectors else []
+    bypass_triggers: dict[str, list[tuple[str, float]]] = {}
+    l2_bypass_pool: list[str] = []
+    if l2_bypass_in_sector:
+        bypass_triggers = layer4_triggers(l2_bypass_in_sector, all_df_map, cfg)
+        bypass_hit_set: set[str] = set()
+        for hits in bypass_triggers.values():
+            for code, _ in hits:
+                bypass_hit_set.add(code)
+        l2_bypass_pool = sorted(bypass_hit_set)
+        if l2_bypass_pool:
+            print(f"[funnel] L2旁路观察池: {len(l2_bypass_pool)} 只 (L2拒绝但有L4信号+板块共振)")
+
     # Markup 阶段、Accumulation ABC 细化、Exit 信号
     markup_symbols = detect_markup_stage(l3_passed, all_df_map, cfg)
     accum_stage_map = detect_accum_stage(l2_passed, all_df_map, cfg)
@@ -487,6 +505,10 @@ def run_funnel_job(
         "by_trigger": {k: len(v) for k, v in triggers.items()},
         "benchmark_context": benchmark_context,
         "latest_close_map": latest_close_map,
+        "min_funnel_score": float(getattr(cfg, "min_funnel_score", 0.0) or 0.0),
+        # L2 旁路观察池
+        "l2_bypass_pool": l2_bypass_pool,
+        "l2_bypass_triggers": bypass_triggers,
         # 阶段识别和退出信号
         "markup_symbols": markup_symbols,
         "accum_stage_map": accum_stage_map,
@@ -588,6 +610,9 @@ def run(
     markup_symbols = metrics.get("markup_symbols", []) or []
     accum_stage_map = metrics.get("accum_stage_map", {}) or {}
     exit_signals = metrics.get("exit_signals", {}) or {}
+    # L2 旁路观察池（由 run_funnel_job 汇总进 metrics）
+    l2_bypass_pool = metrics.get("l2_bypass_pool", []) or []
+    bypass_triggers = metrics.get("l2_bypass_triggers", {}) or {}
     sector_rotation = metrics.get("sector_rotation", {}) or {}
     sector_rotation_map = sector_rotation.get("state_map", {}) or {}
     # 策略：大盘水温驱动的双轨制（Top-Down 择时顺势策略）
@@ -637,6 +662,14 @@ def run(
             f"elapsed={alloc_elapsed:.3f}s"
         )
         selected_for_ai = trend_selected + accum_selected
+
+    min_funnel_score = float(metrics.get("min_funnel_score", 0.0) or 0.0)
+    if score_map and min_funnel_score > 0:
+        before = len(selected_for_ai)
+        selected_for_ai = [c for c in selected_for_ai if score_map.get(c, 0.0) >= min_funnel_score]
+        dropped = before - len(selected_for_ai)
+        if dropped:
+            print(f"[funnel] min_funnel_score={min_funnel_score} 过滤掉 {dropped} 只低质量候选")
 
     if use_legacy_card and use_legacy_selection:
         bench_line = "未知"
@@ -714,6 +747,20 @@ def run(
 
         if not selected_for_ai:
             lines.append("无")
+
+        if l2_bypass_pool:
+            lines.append("")
+            lines.append(f"**【👁 L2旁路观察】{len(l2_bypass_pool)} 只**")
+            lines.append("形态先于强度，不进正式推荐")
+            for code in l2_bypass_pool:
+                name = name_map.get(code, code)
+                bp_reasons = []
+                for key, label in TRIGGER_LABELS.items():
+                    for c, _ in bypass_triggers.get(key, []):
+                        if c == code:
+                            bp_reasons.append(TRIGGER_SHORT_LABELS.get(key, key))
+                industry = str(sector_map.get(code, "") or "")
+                lines.append(f"  {code} {name}  {'+'.join(bp_reasons)}  [{industry}]")
 
         content = "\n".join(lines)
         title = f"🔬 Wyckoff Funnel {date.today().strftime('%Y-%m-%d')}"
@@ -1045,6 +1092,20 @@ def run(
                 "• 分析：候选股票尚未达到日线级别的威科夫触发信号（SOS/Spring/LPS）或阶段转折特征。" if total_cap > 0 else "• 当前大盘水温，AI配额已关闭（total_cap=0）。",
             ]
         )
+
+    if l2_bypass_pool:
+        lines.append("")
+        lines.append(f"**【👁 L2旁路观察】{len(l2_bypass_pool)} 只**")
+        lines.append("形态先于强度，不进正式推荐")
+        for code in l2_bypass_pool:
+            bp_name = name_map.get(code, code)
+            bp_reasons = []
+            for key in TRIGGER_LABELS.keys():
+                for c, _ in bypass_triggers.get(key, []):
+                    if c == code:
+                        bp_reasons.append(TRIGGER_SHORT_LABELS.get(key, key))
+            bp_industry = str(sector_map.get(code, "") or "")
+            lines.append(f"  {code} {bp_name}  {'+'.join(bp_reasons)}  [{bp_industry}]")
 
     content = "\n".join(lines)
     title = f"🔬 Wyckoff Funnel {date.today().strftime('%Y-%m-%d')}"
